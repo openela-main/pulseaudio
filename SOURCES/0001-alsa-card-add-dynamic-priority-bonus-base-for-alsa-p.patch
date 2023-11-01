@@ -1,0 +1,122 @@
+From 832d7ac1144416306de1b6990d70115079bd1935 Mon Sep 17 00:00:00 2001
+From: Hui Wang <hui.wang@canonical.com>
+Date: Fri, 21 Aug 2020 17:34:25 +0800
+Subject: [PATCH] alsa-card: add dynamic priority bonus base for alsa profiles
+
+After applying the commit 0d50e787 ("alsa-card: improve the profile
+availability logic"), we met an new issue. when system selects the
+initial profile, the profile off is selected instead of a profile with
+a valid output device on it. That is the issue we met:
+
+Profiles:
+  HiFi: Default (sinks: 2, sources: 2, priority: 8000, available: no)
+  off: Off (sinks: 0, sources: 0, priority: 0, available: yes)
+Active Profile: off
+Ports:
+  [Out] Headphones: Headphones (priority: 300, latency offset: 0 usec, not available)
+   Part of profile(s): HiFi
+  [Out] Speaker: Speaker (priority: 100, latency offset: 0 usec)
+   Part of profile(s): HiFi
+...
+
+I know the commit 0d50e787 really fixed something, but we still need
+to fix the new issue, to do so, this patch introduces a priority bonus
+for alsa profiles and separate the alsa profiles to 3 groups:
+group a (will be granted priority bonus dynamically):
+a profile has only output ports and at least one port is not unavailable
+a profile has only input ports and at least one port is not unavailable
+a profile has both input and output ports, and at least one output and
+one input ports are not unavailable
+
+group b (will be marked unavailable)
+a profile has only output ports and all ports are unavailable
+a profile has only input ports and all ports are unavailable
+a profile has both output and input ports, and all ports are unavailable
+
+group c
+the rest profiles, their priority and availability is not changed.
+
+With this change, the profile HiFi will become avaialbe:yes, and will
+not be granted priority bonus if no input port is plugged.
+
+The priority bonus provides a higher priority base to profiles, this
+guarantees this patch doesn't break the fix of 0d50e787.
+
+https://gitlab.freedesktop.org/pulseaudio/pulseaudio/-/issues/927
+
+Signed-off-by: Hui Wang <hui.wang@canonical.com>
+Part-of: <https://gitlab.freedesktop.org/pulseaudio/pulseaudio/-/merge_requests/355>
+---
+ src/modules/alsa/module-alsa-card.c | 35 ++++++++++++++++++++++++-----
+ 1 file changed, 30 insertions(+), 5 deletions(-)
+
+diff --git a/src/modules/alsa/module-alsa-card.c b/src/modules/alsa/module-alsa-card.c
+index de2fe9cc4..5349314b5 100644
+--- a/src/modules/alsa/module-alsa-card.c
++++ b/src/modules/alsa/module-alsa-card.c
+@@ -104,6 +104,13 @@ static const char* const valid_modargs[] = {
+ 
+ #define DEFAULT_DEVICE_ID "0"
+ 
++/* dynamic profile priority bonus, for all alsa profiles, the original priority
++   needs to be less than 0x7fff (32767), then could apply the rule of priority
++   bonus. So far there are 2 kinds of alsa profiles, one is from alsa ucm, the
++   other is from mixer profile-sets, their priorities are all far less than 0x7fff
++*/
++#define PROFILE_PRIO_BONUS 0x8000
++
+ struct userdata {
+     pa_core *core;
+     pa_module *module;
+@@ -459,9 +466,19 @@ static int report_jack_state(snd_mixer_elem_t *melem, unsigned int mask) {
+      * as available (well, "unknown" to be precise, but there's little
+      * practical difference).
+      *
+-     * When all output ports are unavailable, we know that all sinks are
+-     * unavailable, and therefore the profile is marked unavailable as well.
+-     * The same applies to input ports as well, of course.
++     * A profile will be marked unavailable:
++     * only contains output ports and all ports are unavailable
++     * only contains input ports and all ports are unavailable
++     * contains both input and output ports and all ports are unavailable
++     *
++     * A profile will be awarded priority bonus:
++     * only contains output ports and at least one port is available
++     * only contains input ports and at least one port is available
++     * contains both output and input ports and at least one output port
++     * and one input port are available
++     *
++     * The rest profiles will not be marked unavailable and will not be
++     * awarded priority bonus
+      *
+      * If there are no output ports at all, but the profile contains at least
+      * one sink, then the output is considered to be available. */
+@@ -476,6 +493,7 @@ static int report_jack_state(snd_mixer_elem_t *melem, unsigned int mask) {
+         bool found_available_output_port = false;
+         pa_available_t available = PA_AVAILABLE_UNKNOWN;
+ 
++        profile->priority &= ~PROFILE_PRIO_BONUS;
+         PA_HASHMAP_FOREACH(port, u->card->ports, state2) {
+             if (!pa_hashmap_get(port->profiles, profile->name))
+                 continue;
+@@ -493,8 +511,15 @@ static int report_jack_state(snd_mixer_elem_t *melem, unsigned int mask) {
+             }
+         }
+ 
+-        if ((has_input_port && !found_available_input_port) || (has_output_port && !found_available_output_port))
+-            available = PA_AVAILABLE_NO;
++        if ((has_input_port && found_available_input_port && !has_output_port) ||
++            (has_output_port && found_available_output_port && !has_input_port) ||
++            (has_input_port && found_available_input_port && has_output_port && found_available_output_port))
++                profile->priority |= PROFILE_PRIO_BONUS;
++
++        if ((has_input_port && !found_available_input_port && has_output_port && !found_available_output_port) ||
++            (has_input_port && !found_available_input_port && !has_output_port) ||
++            (has_output_port && !found_available_output_port && !has_input_port))
++                available = PA_AVAILABLE_NO;
+ 
+         /* We want to update the active profile's status last, so logic that
+          * may change the active profile based on profile availability status
+-- 
+2.36.1
+

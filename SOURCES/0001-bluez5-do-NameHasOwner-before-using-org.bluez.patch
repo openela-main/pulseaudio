@@ -1,0 +1,94 @@
+From e50ec0deb7c20d1daa26cc7eab5a1ff75b9f7bf8 Mon Sep 17 00:00:00 2001
+From: Wim Taymans <wtaymans@redhat.com>
+Date: Wed, 17 Nov 2021 12:28:23 +0100
+Subject: [PATCH] bluez5: do NameHasOwner before using org.bluez
+
+We should not be using org.bluez when the bluetooth service is not
+running or else we might try to activate it. The activation of the
+bluetooth service should be done at boot time.
+---
+ src/modules/bluetooth/bluez5-util.c | 61 ++++++++++++++++++++++++++++-
+ 1 file changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/src/modules/bluetooth/bluez5-util.c b/src/modules/bluetooth/bluez5-util.c
+index a21896ede..282886e45 100644
+--- a/src/modules/bluetooth/bluez5-util.c
++++ b/src/modules/bluetooth/bluez5-util.c
+@@ -1095,6 +1095,65 @@ static void get_managed_objects(pa_bluetooth_discovery *y) {
+     send_and_add_to_pending(y, m, get_managed_objects_reply, NULL);
+ }
+ 
++static void check_name_owner_reply(DBusPendingCall *pending, void *userdata) {
++    pa_dbus_pending *p;
++    pa_bluetooth_discovery *y;
++    DBusMessage *r;
++    DBusError err;
++    bool running;
++
++    pa_assert_se(p = userdata);
++    pa_assert_se(y = p->context_data);
++    pa_assert_se(r = dbus_pending_call_steal_reply(pending));
++
++    if (dbus_message_is_error(r, DBUS_ERROR_UNKNOWN_METHOD)) {
++        pa_log_warn("BlueZ D-Bus ObjectManager not available");
++        goto finish;
++    }
++
++    if (dbus_message_get_type(r) == DBUS_MESSAGE_TYPE_ERROR) {
++        pa_log_error("NameHasOwner() failed: %s: %s", dbus_message_get_error_name(r), pa_dbus_get_error_message(r));
++        goto finish;
++    }
++
++    if (!pa_streq(dbus_message_get_signature(r), "b")) {
++        pa_log_error("Invalid reply signature for NameHasOwner()");
++        goto finish;
++    }
++
++    dbus_error_init(&err);
++    if (!dbus_message_get_args(r, &err, DBUS_TYPE_BOOLEAN, &running, DBUS_TYPE_INVALID)) {
++        pa_log_error("Could not check bluetooth service: %s", err.message);
++        dbus_error_free(&err);
++        goto finish;
++   }
++
++   pa_log_info("bluetooth service running: %s", running ? "yes" : "no");
++   if (running)
++       get_managed_objects(y);
++
++finish:
++    dbus_message_unref(r);
++
++    PA_LLIST_REMOVE(pa_dbus_pending, y->pending, p);
++    pa_dbus_pending_free(p);
++}
++
++static void check_name_owner(pa_bluetooth_discovery *y) {
++    DBusMessage *m;
++    const char *service = BLUEZ_SERVICE;
++
++    pa_assert(y);
++
++    pa_assert_se(m = dbus_message_new_method_call("org.freedesktop.DBus",
++                            "/org/freedesktop/DBus",
++                            "org.freedesktop.DBus",
++                            "NameHasOwner"));
++    dbus_message_append_args(m, DBUS_TYPE_STRING, &service, DBUS_TYPE_INVALID);
++
++    send_and_add_to_pending(y, m, check_name_owner_reply, NULL);
++}
++
+ pa_hook* pa_bluetooth_discovery_hook(pa_bluetooth_discovery *y, pa_bluetooth_hook_t hook) {
+     pa_assert(y);
+     pa_assert(PA_REFCNT_VALUE(y) > 0);
+@@ -1653,7 +1712,7 @@ pa_bluetooth_discovery* pa_bluetooth_discovery_get(pa_core *c, int headset_backe
+         pa_xfree(endpoint);
+     }
+ 
+-    get_managed_objects(y);
++    check_name_owner(y);
+ 
+     return y;
+ 
+-- 
+2.36.1
+
